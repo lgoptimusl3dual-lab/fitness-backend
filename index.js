@@ -5,109 +5,75 @@ import crypto from "crypto";
 import { createClient } from "@supabase/supabase-js";
 
 const app = express();
-
-// IMPORTANT: allow custom header x-telegram-initdata (for browser preflight)
-app.use(
-  cors({
-    origin: true,
-    credentials: true,
-    allowedHeaders: ["Content-Type", "x-telegram-initdata"],
-    methods: ["GET", "POST", "OPTIONS"],
-  })
-);
+app.use(cors());
 app.use(express.json());
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE
-);
+// --- Supabase ---
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE;
 
-// --- Robust Telegram initData verify ---
-function safeEq(a, b) {
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE in env");
+}
+
+const supabase = createClient(SUPABASE_URL ?? "", SUPABASE_SERVICE_ROLE ?? "");
+
+// --- Telegram WebApp initData verify (CORRECT) ---
+function verifyTelegramInitData(initData, botToken) {
+  if (!initData) return { ok: false, reason: "no initData" };
+  if (!botToken) return { ok: false, reason: "no BOT_TOKEN in env" };
+
+  const token = String(botToken).trim();
+
+  // Telegram initData is querystring. Иногда уже декодирован, иногда нет — обработаем безопасно.
+  let raw = String(initData);
   try {
-    const ab = Buffer.from(a);
-    const bb = Buffer.from(b);
-    if (ab.length !== bb.length) return false;
-    return crypto.timingSafeEqual(ab, bb);
+    raw = decodeURIComponent(raw);
   } catch {
-    return false;
-  }
-}
-
-function toBase64Url(buf) {
-  return buf
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-function verifyTelegramInitData(initData, botToken, maxAgeSec = 24 * 60 * 60) {
-  if (!initData || typeof initData !== "string") {
-    return { ok: false, reason: "empty_initData" };
-  }
-  if (!botToken || typeof botToken !== "string") {
-    return { ok: false, reason: "empty_botToken" };
+    // если уже декодировано — ок
   }
 
-  const token = botToken.trim();
-
-  const params = new URLSearchParams(initData);
+  const params = new URLSearchParams(raw);
   const hash = params.get("hash");
-  if (!hash) return { ok: false, reason: "no_hash" };
+  if (!hash) return { ok: false, reason: "no hash" };
   params.delete("hash");
 
-  // auth_date check (optional but good)
-  const authDateStr = params.get("auth_date");
-  if (authDateStr) {
-    const authDate = Number(authDateStr);
-    const now = Math.floor(Date.now() / 1000);
-    if (Number.isFinite(authDate) && now - authDate > maxAgeSec) {
-      return { ok: false, reason: "auth_date_expired" };
-    }
-  }
+  const dataCheckString = [...params.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `${k}=${v}`)
+    .join("\n");
 
-  // data_check_string: sorted key=value joined by \n
-  const pairs = [];
-  for (const [k, v] of params.entries()) pairs.push([k, v]);
-  pairs.sort((a, b) => a[0].localeCompare(b[0]));
-  const dataCheckString = pairs.map(([k, v]) => `${k}=${v}`).join("\n");
+  // ✅ Правильный secretKey для Mini Apps:
+  // secretKey = HMAC_SHA256(key="WebAppData", message=botToken)
+  const secretKey = crypto.createHmac("sha256", "WebAppData").update(token).digest();
 
-  // secret_key = sha256(bot_token)
-  const secretKey = crypto.createHash("sha256").update(token).digest();
-
-  // computed hashes
-  const hmacBuf = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest();
-  const computedHex = hmacBuf.toString("hex");           // common
-  const computedB64Url = toBase64Url(hmacBuf);           // just in case
-
-  const incoming = hash.trim();
-  const incomingLower = incoming.toLowerCase();
+  // computed = HMAC_SHA256(key=secretKey, message=dataCheckString) as hex
+  const computed = crypto.createHmac("sha256", secretKey).update(dataCheckString).digest("hex");
 
   const ok =
-    safeEq(computedHex, incomingLower) ||
-    safeEq(computedB64Url, incoming) ||
-    safeEq(computedB64Url, incomingLower);
+    computed.length === hash.length &&
+    crypto.timingSafeEqual(Buffer.from(computed), Buffer.from(hash));
 
-  if (!ok) {
-    return {
-      ok: false,
-      reason: "hash_mismatch",
-      debug: {
-        incomingPreview: incoming.slice(0, 10),
-        computedHexPreview: computedHex.slice(0, 10),
-        computedB64Preview: computedB64Url.slice(0, 10),
-      },
-    };
-  }
-
-  return { ok: true };
+  return {
+    ok,
+    reason: ok ? null : "hash_mismatch",
+    debug: {
+      incomingPreview: hash.slice(0, 10),
+      computedHexPreview: computed.slice(0, 10),
+    },
+  };
 }
 
 function getTelegramUserFromInitData(initData) {
-  const params = new URLSearchParams(initData);
+  let raw = String(initData || "");
+  try {
+    raw = decodeURIComponent(raw);
+  } catch {}
+
+  const params = new URLSearchParams(raw);
   const userStr = params.get("user");
   if (!userStr) return null;
+
   try {
     return JSON.parse(userStr);
   } catch {
@@ -115,20 +81,21 @@ function getTelegramUserFromInitData(initData) {
   }
 }
 
+// --- Health ---
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 // --- Auth: verify initData and upsert user ---
 app.post("/api/auth/telegram", async (req, res) => {
   const { initData } = req.body;
   if (!initData) return res.status(400).json({ error: "initData required" });
 
   const ver = verifyTelegramInitData(initData, process.env.BOT_TOKEN);
-  if (!ver.ok) {
-    // вернём reason (без секретов)
-    return res.status(401).json({ error: "Invalid initData", reason: ver.reason, debug: ver.debug ?? null });
-  }
+  if (!ver.ok) return res.status(401).json({ error: "Invalid initData", reason: ver.reason, debug: ver.debug });
 
   const tgUser = getTelegramUserFromInitData(initData);
   if (!tgUser?.id) return res.status(400).json({ error: "No user in initData" });
 
+  // upsert in app_users
   const { error } = await supabase.from("app_users").upsert({
     telegram_id: tgUser.id,
     username: tgUser.username ?? null,
@@ -145,10 +112,10 @@ async function requireUser(req, res, next) {
   const initData = req.headers["x-telegram-initdata"];
   if (!initData) return res.status(401).json({ error: "x-telegram-initdata header required" });
 
-  const ver = verifyTelegramInitData(String(initData), process.env.BOT_TOKEN);
+  const ver = verifyTelegramInitData(initData, process.env.BOT_TOKEN);
   if (!ver.ok) return res.status(401).json({ error: "Invalid initData", reason: ver.reason });
 
-  const tgUser = getTelegramUserFromInitData(String(initData));
+  const tgUser = getTelegramUserFromInitData(initData);
   if (!tgUser?.id) return res.status(401).json({ error: "No user" });
 
   req.telegramId = tgUser.id;
@@ -178,7 +145,7 @@ app.get("/api/workouts", requireUser, async (req, res) => {
 
   if (exErr) return res.status(500).json({ error: exErr.message });
 
-  const exIds = ex.map((e) => e.id);
+  const exIds = (ex ?? []).map((e) => e.id);
   const { data: sets, error: sErr } = await supabase
     .from("workout_sets")
     .select("id,exercise_id,set_no,reps,weight_kg")
@@ -188,7 +155,7 @@ app.get("/api/workouts", requireUser, async (req, res) => {
   if (sErr) return res.status(500).json({ error: sErr.message });
 
   const byExercise = new Map();
-  for (const s of sets) {
+  for (const s of sets ?? []) {
     const arr = byExercise.get(s.exercise_id) ?? [];
     arr.push(s);
     byExercise.set(s.exercise_id, arr);
@@ -196,7 +163,7 @@ app.get("/api/workouts", requireUser, async (req, res) => {
 
   res.json({
     ...w,
-    exercises: ex.map((e) => ({
+    exercises: (ex ?? []).map((e) => ({
       ...e,
       sets: byExercise.get(e.id) ?? [],
     })),
@@ -225,12 +192,9 @@ app.post("/api/workouts", requireUser, async (req, res) => {
 
   if (wErr) return res.status(500).json({ error: wErr.message });
 
-  const { data: oldEx } = await supabase
-    .from("workout_exercises")
-    .select("id")
-    .eq("workout_id", w.id);
-
+  const { data: oldEx } = await supabase.from("workout_exercises").select("id").eq("workout_id", w.id);
   const oldIds = (oldEx ?? []).map((x) => x.id);
+
   if (oldIds.length) {
     await supabase.from("workout_sets").delete().in("exercise_id", oldIds);
   }
@@ -272,6 +236,7 @@ app.post("/api/workouts", requireUser, async (req, res) => {
   res.json({ ok: true, workout_id: w.id });
 });
 
+// Render даёт PORT автоматически
 const PORT = Number(process.env.PORT || 3001);
 app.listen(PORT, () => {
   console.log(`Backend running on port ${PORT}`);
